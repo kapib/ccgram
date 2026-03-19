@@ -156,9 +156,9 @@ function sendHtmlMessage(text: string): Promise<unknown> {
 
 const TYPING_SIGNAL_PATH: string = path.join(PROJECT_ROOT, 'src/data', 'typing-active');
 
-function startTypingIndicator(): void {
+function startTypingIndicator(sessionName?: string): void {
   stopTypingIndicator();
-  try { fs.writeFileSync(TYPING_SIGNAL_PATH, String(Date.now())); } catch {}
+  try { fs.writeFileSync(TYPING_SIGNAL_PATH, sessionName || 'unknown'); } catch {}
   const tick = (): void => {
     if (!fs.existsSync(TYPING_SIGNAL_PATH)) {
       stopTypingIndicator();
@@ -976,7 +976,7 @@ async function injectAndRespond(session: SessionEntry, command: string, workspac
       await sleep(150);
       await tmuxExec(`tmux send-keys -t ${tmuxName} C-m`);
     }
-    startTypingIndicator();
+    startTypingIndicator(tmuxName);
     return true;
   } catch (err: unknown) {
     await sendMessage(`\u274c Failed: ${(err as Error).message}`);
@@ -1201,7 +1201,7 @@ async function processCallbackQuery(query: TelegramCallbackQuery): Promise<void>
       }
 
       await answerCallbackQuery(query.id, `Selected: ${optionLabel}`);
-      startTypingIndicator(); // ensure Stop hook routes response back to Telegram
+      startTypingIndicator(tmuxSessOpt); // ensure Stop hook routes response back to Telegram
     } catch (err: unknown) {
       logger.error(`Failed to inject keystroke: ${(err as Error).message}`);
       await answerCallbackQuery(query.id, 'Failed to send selection');
@@ -1258,7 +1258,7 @@ async function processCallbackQuery(query: TelegramCallbackQuery): Promise<void>
       }
 
       await answerCallbackQuery(query.id, `Submitted ${selectedLabels.length} options`);
-      startTypingIndicator(); // ensure Stop hook routes response back to Telegram
+      startTypingIndicator(tmuxSessSubmit); // ensure Stop hook routes response back to Telegram
     } catch (err: unknown) {
       logger.error(`Failed to inject keystrokes: ${(err as Error).message}`);
       await answerCallbackQuery(query.id, 'Failed to send selections');
@@ -1310,7 +1310,7 @@ async function processCallbackQuery(query: TelegramCallbackQuery): Promise<void>
             await sessionSendKey(tmux, 'Down');
           }
           await sessionSendKey(tmux, 'Enter');
-          startTypingIndicator(); // ensure Stop hook routes response back to Telegram
+          startTypingIndicator(tmux); // ensure Stop hook routes response back to Telegram
           logger.info(`Injected question answer into ${tmux}: option ${parsed.optionIndex}`);
         } catch (err: unknown) {
           logger.error(`Failed to inject question answer: ${(err as Error).message}`);
@@ -1517,7 +1517,57 @@ function sleep(ms: number): Promise<void> {
 // ── Health check server ──────────────────────────────────────────
 
 function startHealthServer(port: number): void {
-  const server = http.createServer((req: http.IncomingMessage, res: http.ServerResponse) => {
+  const INJECT_TOKEN: string = process.env.INJECT_TOKEN || 'kuro-daemon-default';
+
+  const server = http.createServer(async (req: http.IncomingMessage, res: http.ServerResponse) => {
+    // ── /inject endpoint (kuro-daemon → PTY session) ──
+    if (req.url === '/inject' && req.method === 'POST') {
+      let body = '';
+      req.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+      req.on('end', async () => {
+        try {
+          const payload = JSON.parse(body);
+          const { workspace, command, token } = payload;
+
+          if (token !== INJECT_TOKEN) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'invalid token' }));
+            return;
+          }
+
+          if (!workspace || !command) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'workspace and command required' }));
+            return;
+          }
+
+          const resolved: ResolveResult = resolveWorkspace(workspace);
+          if (resolved.type === 'none') {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `workspace not found: ${workspace}` }));
+            return;
+          }
+          if (resolved.type === 'ambiguous') {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'ambiguous workspace' }));
+            return;
+          }
+
+          const match = resolved.match;
+          const resolvedName: string = resolved.workspace;
+
+          const ok: boolean = await injectAndRespond(match.session, command, resolvedName);
+          res.writeHead(ok ? 200 : 500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok, workspace: resolvedName }));
+        } catch (err: unknown) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: (err as Error).message }));
+        }
+      });
+      return;
+    }
+
+    // ── /health endpoint ──
     if (req.url !== '/health') {
       res.writeHead(404);
       res.end('Not found');

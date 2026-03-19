@@ -87,11 +87,46 @@ async function main(): Promise<void> {
 
   // If the bot injected this command from Telegram, typing-active exists — always notify
   // so the response goes back to Telegram regardless of terminal activity.
+  // typing-active contains "pty" when written by ccgram's PTY session.
+  // Only non-tmux sessions (PTY) should match — tmux sessions (e.g. mac-mini-dev) should not.
   const typingActivePath = path.join(PROJECT_ROOT, 'src/data', 'typing-active');
-  const isTelegramInjected = fs.existsSync(typingActivePath);
+  // Only consider typing-active if this hook is running INSIDE a tmux session.
+  // process.env.TMUX is set when inside tmux. Sessions started by the user directly
+  // (not via ccgram) run outside tmux, so they must never match.
+  const isInsideTmuxForTyping = !!process.env.TMUX;
+  let isTelegramInjected = false;
+  if (isInsideTmuxForTyping && fs.existsSync(typingActivePath)) {
+    const typingContent = fs.readFileSync(typingActivePath, 'utf8').trim();
+    isTelegramInjected = (typingContent === tmuxSession);
+  }
+
+  // Check if this hook is running inside a ccgram-managed tmux session.
+  // Key insight: process.env.TMUX is only set when running INSIDE a tmux session.
+  // Claude Code sessions started by the user (not via ccgram) run outside tmux,
+  // so process.env.TMUX is empty even though `tmux display-message` may still work.
+  const isInsideTmux = !!process.env.TMUX;
+  let isCcgramSession = false;
+  if (isInsideTmux) {
+    try {
+      const sessionMapPath = path.join(PROJECT_ROOT, 'src/data', 'session-map.json');
+      const sessionMap = JSON.parse(fs.readFileSync(sessionMapPath, 'utf8'));
+      for (const [, entry] of Object.entries(sessionMap)) {
+        if (entry && (entry as any).tmuxSession === tmuxSession) {
+          isCcgramSession = true;
+          break;
+        }
+      }
+    } catch {}
+  }
+
+  // Only send Telegram notifications from ccgram-managed sessions or Telegram-injected
+  if (!isCcgramSession && !isTelegramInjected) {
+    try { fs.unlinkSync(typingActivePath); } catch {}
+    return;
+  }
 
   // Suppress notification if user is actively at terminal AND this wasn't Telegram-injected
-  if (!config.alwaysNotify && !isTelegramInjected && isUserActiveAtTerminal()) {
+  if (!config.alwaysNotify && !isTelegramInjected && isUserActiveAtTerminal(cwd)) {
     try { fs.unlinkSync(typingActivePath); } catch {}
     return;
   }
