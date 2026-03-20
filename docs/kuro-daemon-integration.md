@@ -185,3 +185,164 @@ if (!isCcgramSession && !isTelegramInjected) {
 - `8e9af87` — feat: kuro-daemon用inject APIとTelegram通知セッション分離
 - `0536018` — fix: typing-active競合修正 — 対象外セッションがファイルを削除しない
 - `c2fdad4` — docs: kuro-daemon連携の改造ドキュメント
+
+## 2026-03-20 安定化修正
+
+### 背景
+
+上の修正で、`/inject` と Telegram への応答返送は概ね動くようになった。
+ただし、実装としてはまだ次の不安定要因が残っていた。
+
+- `typing-active` が単一ファイルで、複数セッションが同じ状態を奪い合う
+- `enhanced-hook-notify` が `process.env.TMUX` に強く依存しており、tmux / PTY / 直起動で判定が割れやすい
+- `active-check.ts` の workspace 対応が後付けで、既存シグネチャ互換を壊していた
+- workspace 名ベースの `/tmp/claude_last_msg_time_<workspace>` 生成が衝突しうる
+
+レビュー時点では「今の使い方では動いているが、条件が少しズレると壊れる」状態だったため、
+その場しのぎの分岐追加ではなく、通知ルーティングとセッション識別の仕組み自体を整理し直した。
+
+### 今回の修正方針
+
+方針は 3 つ。
+
+1. **単一の `typing-active` ファイルをやめる**
+   セッション単位の remote state に置き換え、どの応答を Telegram に返すべきかを session ごとに管理する。
+
+2. **tmux / PTY を同じ識別軸で扱う**
+   `TMUX` の有無ではなく、「ccgram が起動した session かどうか」で判定する。
+   そのために、Claude 起動時に `CCGRAM_SESSION_NAME` / `CCGRAM_SESSION_TYPE` を埋め込む。
+
+3. **`active-check` を後方互換ありで作り直す**
+   既存の `isUserActiveAtTerminal(threshold)` 呼び出しを壊さず、
+   workspace 単位ファイルも path hash 付きで衝突しないようにする。
+
+### 具体的な変更
+
+#### 1. セッション単位の remote state を追加
+
+**追加ファイル:** `src/utils/notification-state.ts`
+
+追加した state は以下。
+
+- `routeToTelegram` — この session の応答を Telegram に返すべきか
+- `typing` — Telegram 側に typing 表示を出すべきか
+- `workspace` — どの workspace に属する state か
+- `startedAt` / `updatedAt` — TTL 管理用
+
+これにより、従来の `src/data/typing-active` 1 ファイルに依存しなくなった。
+複数 session が同時に動いても、片方の状態をもう片方が消すことがなくなる。
+
+#### 2. セッション識別ユーティリティを追加
+
+**追加ファイル:** `src/utils/session-identity.ts`
+
+`detectSessionName()` / `resolveSessionContext()` をここに集約した。
+
+役割:
+
+- `CCGRAM_SESSION_NAME` があれば最優先で使う
+- なければ tmux セッション名取得
+- それも無理なら cwd 由来の sanitize 名を使う
+- `session-map.json` と `session_id` を突き合わせて、ccgram 管理 session かどうかを判定
+
+これを `enhanced-hook-notify.ts` / `permission-hook.ts` / `question-notify.ts` で共通利用するように変更。
+
+#### 3. Claude 起動時に session 情報を環境変数で注入
+
+**変更ファイル:** `workspace-telegram-bot.ts`, `src/utils/pty-session-manager.ts`
+
+tmux / PTY のどちらで起動する場合も、
+Claude プロセスに次の env を渡すようにした。
+
+- `CCGRAM_SESSION_NAME`
+- `CCGRAM_SESSION_TYPE`
+
+これにより hook 側は「今のプロセスは ccgram 管理のどの session か」を直接判断できる。
+以前のように `process.env.TMUX` の有無だけに頼らなくてよくなった。
+
+#### 4. `enhanced-hook-notify.ts` の判定ロジックを整理
+
+以前は以下のような構造だった。
+
+- `typing-active` の存在を見る
+- `TMUX` があるかを見る
+- `session-map` と照合する
+
+今回からは次の順にした。
+
+- `resolveSessionContext()` で session を特定
+- `notification-state.ts` の remote state を見て Telegram 返送対象か判定
+- `active-check.ts` で「ユーザーがその workspace で今 active か」を判定
+
+これで tmux / PTY / 直起動が同じ判定フローに乗る。
+
+#### 5. `active-check.ts` を互換修正
+
+**変更ファイル:** `src/utils/active-check.ts`, `user-prompt-hook.ts`
+
+修正内容:
+
+- `isUserActiveAtTerminal(threshold)` の旧シグネチャ互換を戻した
+- `isUserActiveAtTerminal(cwd, threshold)` も使える overload にした
+- workspace ごとの timestamp file 名に cwd hash を付与した
+- `user-prompt-hook.ts` は per-workspace と global fallback の両方に timestamp を書くようにした
+
+これで従来コードを壊さず、workspace 別抑止もできるようになった。
+
+### なぜこの設計にしたか
+
+ポイントは、「通知を返すべき相手」を **グローバル状態ではなく session に紐づける** こと。
+
+もともとの問題は、`typing-active` が「今どこかで Telegram 起点の処理が走っている」ことしか表現できなかった点にある。
+これだと session A の処理と session B の hook が競合した時に、どちらの応答を Telegram に返すべきか判定できない。
+
+今回の修正では、最初から「どの session が Telegram 起点か」を state に持たせた。
+そのため、判定は
+
+- どの session の hook か
+- その session は remote route 中か
+
+の 2 つだけで済む。
+
+この形にしておくと、将来的に session が増えても構造が崩れにくい。
+
+### テストと確認結果
+
+ローカルで次を確認した。
+
+- `npm run build` — 成功
+- `npm test` — 91 tests 全通
+
+追加した test:
+
+- `test/notification-state.test.js`
+- `test/session-identity.test.js`
+
+既存 test 更新:
+
+- `test/active-check.test.js`
+
+実機確認:
+
+- `/inject` で `claude-env` へ送信 → Telegram に応答返送
+- AskUserQuestion → Telegram に選択肢表示
+- PermissionRequest（`/etc/hosts` 読み取り）→ Telegram に permission ボタン表示
+
+### まだ残る制約
+
+今回直したのは **Claude Code / ccgram 内部の通知ルーティング** まで。
+macOS ネイティブの TCC 権限ダイアログは別問題で、ここはまだ Telegram 経由では扱えない。
+
+例:
+
+- Automation 権限
+- Accessibility 権限
+- Full Disk Access
+- Screen Recording
+- Input Monitoring
+
+この層は Claude hook ではなく OS ダイアログなので、必要なら事前許可や専用実行環境での運用設計が別途必要。
+
+### 関連コミット（安定化）
+
+- `b0d1402` — fix: stabilize ccgram remote routing and hook state
