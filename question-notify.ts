@@ -23,6 +23,8 @@ import https from 'https';
 import { extractWorkspaceName, trackNotificationMessage } from './workspace-router';
 import { generatePromptId, writePending } from './prompt-bridge';
 import { isUserActiveAtTerminal } from './src/utils/active-check';
+import { isRemoteSessionActive } from './src/utils/notification-state';
+import { resolveSessionContext } from './src/utils/session-identity';
 import type { AskUserQuestionItem, InlineKeyboardMarkup, InlineKeyboardButton, TelegramMessage } from './src/types';
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -41,16 +43,6 @@ async function main(): Promise<void> {
 
   const raw = await readStdin();
 
-  // Skip Telegram notification if user is at terminal AND this wasn't Telegram-injected.
-  // If the command came from Telegram, the question must go back to Telegram.
-  const typingActivePath = path.join(PROJECT_ROOT, 'src/data', 'typing-active');
-  const isTelegramInjected = fs.existsSync(typingActivePath);
-  if (!isTelegramInjected && isUserActiveAtTerminal()) {
-    return;
-  }
-
-  // Delay so permission notification appears first in Telegram
-  await new Promise<void>(r => setTimeout(r, 2000));
   let payload: Record<string, unknown>;
   try {
     payload = JSON.parse(raw);
@@ -58,8 +50,25 @@ async function main(): Promise<void> {
     return;
   }
 
+  const sessionId = (payload.session_id as string) || null;
+  const sessionContext = resolveSessionContext({
+    cwd: (payload.cwd as string) || process.cwd(),
+    sessionId,
+  });
   const toolInput = (payload.tool_input || {}) as Record<string, unknown>;
-  const cwd = (payload.cwd as string) || process.cwd();
+  const cwd = sessionContext.cwd;
+
+  // Skip Telegram notification if user is at terminal AND this wasn't Telegram-injected.
+  // If the command came from Telegram, the question must go back to Telegram.
+  const isTelegramInjected = !!(
+    sessionContext.sessionName && isRemoteSessionActive(sessionContext.sessionName)
+  );
+  if (!isTelegramInjected && isUserActiveAtTerminal(cwd)) {
+    return;
+  }
+
+  // Delay so permission notification appears first in Telegram
+  await new Promise<void>(r => setTimeout(r, 2000));
   const workspace = extractWorkspaceName(cwd)!;
 
   // Extract questions from tool_input
@@ -69,7 +78,7 @@ async function main(): Promise<void> {
   }
 
   // Detect session name for keystroke injection (tmux preferred, CWD-derived fallback)
-  const tmuxSession = detectSessionName(cwd);
+  const tmuxSession = sessionContext.entry?.tmuxSession || sessionContext.sessionName;
 
   const totalQuestions = questions.length;
 
@@ -267,21 +276,6 @@ function readStdin(): Promise<string> {
       }
     }, 500);
   });
-}
-
-function detectSessionName(cwd: string): string | null {
-  // 1. Try tmux (existing behaviour)
-  if (process.env.TMUX) {
-    try {
-      const { execSync } = require('child_process');
-      return execSync('tmux display-message -p "#S"', { encoding: 'utf8' }).trim();
-    } catch {}
-  }
-  // 2. Derive from CWD — apply the same sanitization /new uses for session names
-  // (dots, colons, spaces → hyphens) so the name matches the PTY handle key
-  const raw = extractWorkspaceName(cwd);
-  if (!raw) return null;
-  return raw.replace(/[.:\s]/g, '-');
 }
 
 function escapeMarkdown(text: string): string {

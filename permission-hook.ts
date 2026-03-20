@@ -23,6 +23,8 @@ import { execSync } from 'child_process';
 import { extractWorkspaceName, trackNotificationMessage } from './workspace-router';
 import { generatePromptId, writePending, cleanPrompt, PROMPTS_DIR } from './prompt-bridge';
 import { isUserActiveAtTerminal } from './src/utils/active-check';
+import { isRemoteSessionActive } from './src/utils/notification-state';
+import { resolveSessionContext } from './src/utils/session-identity';
 import type { InlineKeyboardMarkup, TelegramMessage, PermissionHookOutput } from './src/types';
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -51,6 +53,11 @@ async function main(): Promise<void> {
     return; // Can't parse — exit without decision
   }
 
+  const sessionId = (payload.session_id as string) || null;
+  const sessionContext = resolveSessionContext({
+    cwd: (payload.cwd as string) || process.cwd(),
+    sessionId,
+  });
   const toolName = (payload.tool_name as string) || 'Unknown';
 
   // AskUserQuestion: exit silently so Claude Code shows the interactive
@@ -66,18 +73,19 @@ async function main(): Promise<void> {
   // Uses the same 300s (5 min) threshold as notification hooks.
   // If user stepped away more than 5 min ago, Telegram handles the permission
   // so Claude isn't left stuck waiting with no way to respond.
-  const typingActivePath = path.join(PROJECT_ROOT, 'src/data', 'typing-active');
-  const isTelegramInjected = fs.existsSync(typingActivePath);
-  if (!isTelegramInjected && isUserActiveAtTerminal()) {
+  const cwd = sessionContext.cwd;
+  const isTelegramInjected = !!(
+    sessionContext.sessionName && isRemoteSessionActive(sessionContext.sessionName)
+  );
+  if (!isTelegramInjected && isUserActiveAtTerminal(cwd)) {
     debugLog(`[skip] User is at terminal (within 5 min) — deferring to Claude Code's own permission UI`);
     return;
   }
 
   const toolInput = (payload.tool_input || {}) as Record<string, unknown>;
-  const cwd = (payload.cwd as string) || process.cwd();
   const workspace = extractWorkspaceName(cwd)!;
   const promptId = generatePromptId();
-  const tmuxSession = detectSessionName(cwd);
+  const tmuxSession = sessionContext.entry?.tmuxSession || sessionContext.sessionName;
 
   const isPlan = toolName === 'ExitPlanMode';
 
@@ -298,20 +306,6 @@ function readStdin(): Promise<string> {
       }
     }, 500);
   });
-}
-
-function detectSessionName(cwd: string): string | null {
-  // 1. Try tmux (existing behaviour)
-  if (process.env.TMUX) {
-    try {
-      return execSync('tmux display-message -p "#S"', { encoding: 'utf8' }).trim();
-    } catch {}
-  }
-  // 2. Derive from CWD — apply the same sanitization /new uses for session names
-  // (dots, colons, spaces → hyphens) so the name matches the PTY handle key
-  const raw = extractWorkspaceName(cwd);
-  if (!raw) return null;
-  return raw.replace(/[.:\s]/g, '-');
 }
 
 function formatToolDescription(toolName: string, toolInput: Record<string, unknown>): string {

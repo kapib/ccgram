@@ -55,6 +55,13 @@ import {
 } from './prompt-bridge';
 import { parseCallbackData } from './src/utils/callback-parser';
 import { ptySessionManager } from './src/utils/pty-session-manager';
+import {
+  markRemoteSession,
+  stopRemoteTyping,
+  clearRemoteSession,
+  clearAllRemoteSessions,
+  isRemoteSessionTyping,
+} from './src/utils/notification-state';
 import Logger from './src/core/logger';
 import type {
   TelegramMessage,
@@ -92,7 +99,7 @@ if (!CHAT_ID || CHAT_ID === 'YOUR_CHAT_ID_HERE') {
 let lastUpdateId: number = 0;
 let lastPollTime: number | null = null;   // timestamp of last successful getUpdates call
 const startTime: number = Date.now();
-const activeTypingIntervals: Map<string, { intervalId: NodeJS.Timeout; timeoutId: NodeJS.Timeout }> = new Map(); // workspace → intervalId
+const activeTypingIntervals: Map<string, { intervalId: NodeJS.Timeout; timeoutId: NodeJS.Timeout }> = new Map();
 
 // ── Telegram API helpers ────────────────────────────────────────
 
@@ -154,32 +161,58 @@ function sendHtmlMessage(text: string): Promise<unknown> {
   });
 }
 
-const TYPING_SIGNAL_PATH: string = path.join(PROJECT_ROOT, 'src/data', 'typing-active');
-
-function startTypingIndicator(sessionName?: string): void {
-  stopTypingIndicator();
-  try { fs.writeFileSync(TYPING_SIGNAL_PATH, sessionName || 'unknown'); } catch {}
+function startTypingIndicator(sessionName?: string, workspace?: string): void {
+  if (!sessionName) return;
+  stopTypingIndicator(sessionName);
+  markRemoteSession(sessionName, workspace);
   const tick = (): void => {
-    if (!fs.existsSync(TYPING_SIGNAL_PATH)) {
-      stopTypingIndicator();
+    if (!isRemoteSessionTyping(sessionName)) {
+      stopTypingIndicator(sessionName);
       return;
     }
     telegramAPI('sendChatAction', { chat_id: CHAT_ID, action: 'typing' }).catch(() => {});
   };
   tick();
   const intervalId: NodeJS.Timeout = setInterval(tick, 4500);
-  const timeoutId: NodeJS.Timeout = setTimeout(() => stopTypingIndicator(), 5 * 60 * 1000);
-  activeTypingIntervals.set('_active', { intervalId, timeoutId });
+  const timeoutId: NodeJS.Timeout = setTimeout(() => stopTypingIndicator(sessionName), 5 * 60 * 1000);
+  activeTypingIntervals.set(sessionName, { intervalId, timeoutId });
 }
 
-function stopTypingIndicator(): void {
-  const entry = activeTypingIntervals.get('_active');
-  if (entry) {
+function stopTypingIndicator(sessionName?: string): void {
+  if (sessionName) {
+    const entry = activeTypingIntervals.get(sessionName);
+    if (entry) {
+      clearInterval(entry.intervalId);
+      clearTimeout(entry.timeoutId);
+      activeTypingIntervals.delete(sessionName);
+    }
+    stopRemoteTyping(sessionName);
+    return;
+  }
+
+  for (const [name, entry] of activeTypingIntervals) {
     clearInterval(entry.intervalId);
     clearTimeout(entry.timeoutId);
-    activeTypingIntervals.delete('_active');
+    stopRemoteTyping(name);
   }
-  try { fs.unlinkSync(TYPING_SIGNAL_PATH); } catch {}
+  activeTypingIntervals.clear();
+}
+
+function shellEscape(value: string): string {
+  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
+}
+
+function buildClaudeLaunchCommand(
+  sessionName: string,
+  sessionType: 'tmux' | 'pty',
+  args: string[] = []
+): string {
+  const envPrefix = [
+    `CCGRAM_SESSION_NAME=${shellEscape(sessionName)}`,
+    `CCGRAM_SESSION_TYPE=${shellEscape(sessionType)}`,
+  ].join(' ');
+  const escapedArgs = args.map(arg => shellEscape(arg)).join(' ');
+  return `${envPrefix} claude${escapedArgs ? ` ${escapedArgs}` : ''}`;
 }
 
 async function registerBotCommands(): Promise<void> {
@@ -641,7 +674,8 @@ async function startProject(name: string): Promise<void> {
     try {
       await tmuxExec(`tmux new-session -d -s "${tmuxName}" -c "${projectDir}"`);
       await sleep(300);
-      await tmuxExec(`tmux send-keys -t "${tmuxName}" 'claude' C-m`);
+      const launchCmd = buildClaudeLaunchCommand(tmuxName, 'tmux');
+      await tmuxExec(`tmux send-keys -t "${tmuxName}" ${shellEscape(launchCmd)} C-m`);
     } catch (err: unknown) {
       await sendMessage(`Failed to start session: ${(err as Error).message}`);
       return;
@@ -662,7 +696,12 @@ async function startProject(name: string): Promise<void> {
     }
   } else if (ptySessionManager.isAvailable()) {
     // PTY path — spawns 'claude' directly (no separate send-keys step)
-    const ok = ptySessionManager.spawn(tmuxName, projectDir);
+    const ok = ptySessionManager.spawn(
+      tmuxName,
+      projectDir,
+      [],
+      { CCGRAM_SESSION_NAME: tmuxName, CCGRAM_SESSION_TYPE: 'pty' }
+    );
     if (!ok) { await sendMessage('Failed to spawn PTY session.'); return; }
 
     upsertSession({ cwd: projectDir, tmuxSession: tmuxName, status: 'starting', sessionId: null, sessionType: 'pty' });
@@ -874,7 +913,8 @@ async function startProjectResume(name: string, projectDir: string, sessionId: s
       // (just an unknown command, won't affect the subsequent claude launch)
       await tmuxExec(`tmux send-keys -t "${tmuxName}" '/exit' C-m`);
       await sleep(2000);
-      await tmuxExec(`tmux send-keys -t "${tmuxName}" 'claude --resume ${sessionId}' C-m`);
+      const launchCmd = buildClaudeLaunchCommand(tmuxName, 'tmux', ['--resume', sessionId]);
+      await tmuxExec(`tmux send-keys -t "${tmuxName}" ${shellEscape(launchCmd)} C-m`);
     } catch (err: unknown) {
       await sendMessage(`Failed to switch session: ${(err as Error).message}`);
       return;
@@ -904,7 +944,8 @@ async function startProjectResume(name: string, projectDir: string, sessionId: s
     try {
       await tmuxExec(`tmux new-session -d -s "${tmuxName}" -c "${projectDir}"`);
       await sleep(300);
-      await tmuxExec(`tmux send-keys -t "${tmuxName}" 'claude --resume ${sessionId}' C-m`);
+      const launchCmd = buildClaudeLaunchCommand(tmuxName, 'tmux', ['--resume', sessionId]);
+      await tmuxExec(`tmux send-keys -t "${tmuxName}" ${shellEscape(launchCmd)} C-m`);
     } catch (err: unknown) {
       await sendMessage(`Failed to start session: ${(err as Error).message}`);
       return;
@@ -925,7 +966,12 @@ async function startProjectResume(name: string, projectDir: string, sessionId: s
       trackNotificationMessage(msg.message_id, name, 'resume-session');
     }
   } else if (ptySessionManager.isAvailable()) {
-    const ok = ptySessionManager.spawn(tmuxName, projectDir, ['--resume', sessionId]);
+    const ok = ptySessionManager.spawn(
+      tmuxName,
+      projectDir,
+      ['--resume', sessionId],
+      { CCGRAM_SESSION_NAME: tmuxName, CCGRAM_SESSION_TYPE: 'pty' }
+    );
     if (!ok) { await sendMessage('Failed to spawn PTY session.'); return; }
 
     upsertSession({ cwd: projectDir, tmuxSession: tmuxName, status: 'starting', sessionId, sessionType: 'pty' });
@@ -976,7 +1022,7 @@ async function injectAndRespond(session: SessionEntry, command: string, workspac
       await sleep(150);
       await tmuxExec(`tmux send-keys -t ${tmuxName} C-m`);
     }
-    startTypingIndicator(tmuxName);
+    startTypingIndicator(tmuxName, workspace);
     return true;
   } catch (err: unknown) {
     await sendMessage(`\u274c Failed: ${(err as Error).message}`);
@@ -1127,6 +1173,9 @@ async function processCallbackQuery(query: TelegramCallbackQuery): Promise<void>
       writeResponse(promptId, { action });
       logger.info(`Wrote permission response for promptId=${promptId}: action=${action}`);
       await answerCallbackQuery(query.id, label);
+      if (action !== 'deny' && pending.tmuxSession) {
+        startTypingIndicator(pending.tmuxSession as string, pending.workspace as string | undefined);
+      }
     } catch (err: unknown) {
       logger.error(`Failed to write permission response: ${(err as Error).message}`);
       await answerCallbackQuery(query.id, 'Failed to save response');
@@ -1201,7 +1250,7 @@ async function processCallbackQuery(query: TelegramCallbackQuery): Promise<void>
       }
 
       await answerCallbackQuery(query.id, `Selected: ${optionLabel}`);
-      startTypingIndicator(tmuxSessOpt); // ensure Stop hook routes response back to Telegram
+      startTypingIndicator(tmuxSessOpt, pending.workspace as string | undefined); // ensure Stop hook routes response back to Telegram
     } catch (err: unknown) {
       logger.error(`Failed to inject keystroke: ${(err as Error).message}`);
       await answerCallbackQuery(query.id, 'Failed to send selection');
@@ -1258,7 +1307,7 @@ async function processCallbackQuery(query: TelegramCallbackQuery): Promise<void>
       }
 
       await answerCallbackQuery(query.id, `Submitted ${selectedLabels.length} options`);
-      startTypingIndicator(tmuxSessSubmit); // ensure Stop hook routes response back to Telegram
+      startTypingIndicator(tmuxSessSubmit, pending.workspace as string | undefined); // ensure Stop hook routes response back to Telegram
     } catch (err: unknown) {
       logger.error(`Failed to inject keystrokes: ${(err as Error).message}`);
       await answerCallbackQuery(query.id, 'Failed to send selections');
@@ -1310,7 +1359,7 @@ async function processCallbackQuery(query: TelegramCallbackQuery): Promise<void>
             await sessionSendKey(tmux, 'Down');
           }
           await sessionSendKey(tmux, 'Enter');
-          startTypingIndicator(tmux); // ensure Stop hook routes response back to Telegram
+          startTypingIndicator(tmux, pending.workspace as string | undefined); // ensure Stop hook routes response back to Telegram
           logger.info(`Injected question answer into ${tmux}: option ${parsed.optionIndex}`);
         } catch (err: unknown) {
           logger.error(`Failed to inject question answer: ${(err as Error).message}`);
@@ -1612,6 +1661,7 @@ async function start(): Promise<void> {
   // Ensure data directory exists
   const dataDir: string = path.join(PROJECT_ROOT, 'src/data');
   fs.mkdirSync(dataDir, { recursive: true });
+  clearAllRemoteSessions();
 
   const { version } = require(path.join(PROJECT_ROOT, 'package.json'));
   logger.info(`CCGram v${version} — Starting Telegram bot (long polling)...`);
@@ -1646,10 +1696,12 @@ async function start(): Promise<void> {
 // Graceful shutdown
 process.on('SIGINT', () => {
   logger.info('Shutting down...');
+  clearAllRemoteSessions();
   process.exit(0);
 });
 process.on('SIGTERM', () => {
   logger.info('Shutting down...');
+  clearAllRemoteSessions();
   process.exit(0);
 });
 

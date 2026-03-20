@@ -72,7 +72,7 @@ export class PtySessionManager {
    * @param args  Optional CLI args passed to claude (e.g. ['--resume', '<id>'])
    * @returns true on success, false on failure
    */
-  spawn(name: string, cwd: string, args: string[] = []): boolean {
+  spawn(name: string, cwd: string, args: string[] = [], extraEnv: Record<string, string> = {}): boolean {
     if (!this.ptyModule) return false;
 
     // Kill any existing handle for this name to avoid orphaned processes
@@ -87,7 +87,7 @@ export class PtySessionManager {
         cols: 220,
         rows: 50,
         cwd,
-        env: { ...process.env },
+        env: { ...process.env, ...extraEnv },
       });
 
       this.handles.set(name, pty);

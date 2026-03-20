@@ -1,26 +1,34 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
-import { isUserActiveAtTerminal } from '../src/utils/active-check.js';
+import { getLastMsgFile, isUserActiveAtTerminal } from '../src/utils/active-check.js';
 
 const LAST_MSG_FILE = '/tmp/claude_last_msg_time';
+const WORKSPACE_FILE = getLastMsgFile('/tmp/projects/demo.workspace');
 
 function nowSecs() {
   return Math.floor(Date.now() / 1000);
 }
 
 let savedContent = null;
+let savedWorkspaceContent = null;
 
 beforeEach(() => {
   // Save existing file so we can restore it after the test
   try { savedContent = fs.readFileSync(LAST_MSG_FILE, 'utf8'); } catch { savedContent = null; }
+  try { savedWorkspaceContent = fs.readFileSync(WORKSPACE_FILE, 'utf8'); } catch { savedWorkspaceContent = null; }
   try { fs.unlinkSync(LAST_MSG_FILE); } catch {}
+  try { fs.unlinkSync(WORKSPACE_FILE); } catch {}
   delete process.env.ACTIVE_THRESHOLD_SECONDS;
 });
 
 afterEach(() => {
   try { fs.unlinkSync(LAST_MSG_FILE); } catch {}
+  try { fs.unlinkSync(WORKSPACE_FILE); } catch {}
   if (savedContent !== null) {
     fs.writeFileSync(LAST_MSG_FILE, savedContent);
+  }
+  if (savedWorkspaceContent !== null) {
+    fs.writeFileSync(WORKSPACE_FILE, savedWorkspaceContent);
   }
   delete process.env.ACTIVE_THRESHOLD_SECONDS;
 });
@@ -68,5 +76,22 @@ describe('isUserActiveAtTerminal', () => {
   it('returns false for empty file', () => {
     fs.writeFileSync(LAST_MSG_FILE, '');
     expect(isUserActiveAtTerminal()).toBe(false);
+  });
+
+  it('uses a per-workspace file when cwd is provided', () => {
+    fs.writeFileSync(WORKSPACE_FILE, String(nowSecs() - 20));
+    expect(isUserActiveAtTerminal('/tmp/projects/demo.workspace', 60)).toBe(true);
+    expect(isUserActiveAtTerminal('/tmp/projects/demo.workspace', 10)).toBe(false);
+  });
+
+  it('falls back to the global file when workspace file is missing', () => {
+    fs.writeFileSync(LAST_MSG_FILE, String(nowSecs() - 20));
+    expect(isUserActiveAtTerminal('/tmp/projects/demo.workspace', 60)).toBe(true);
+  });
+
+  it('derives unique files for similar workspace basenames', () => {
+    const file1 = getLastMsgFile('/tmp/projects/foo.bar');
+    const file2 = getLastMsgFile('/tmp/projects/foo_bar');
+    expect(file1).not.toBe(file2);
   });
 });

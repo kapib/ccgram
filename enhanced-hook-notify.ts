@@ -24,6 +24,12 @@ import Logger from './src/core/logger';
 import { upsertSession, extractWorkspaceName, trackNotificationMessage } from './workspace-router';
 import { hasPendingForWorkspace } from './prompt-bridge';
 import { isUserActiveAtTerminal } from './src/utils/active-check';
+import {
+  clearRemoteSession,
+  isRemoteSessionActive,
+  stopRemoteTyping,
+} from './src/utils/notification-state';
+import { resolveSessionContext } from './src/utils/session-identity';
 import type { TelegramMessage } from './src/types';
 
 const logger = new Logger('hook:enhanced');
@@ -64,79 +70,53 @@ async function main(): Promise<void> {
     payload = {};
   }
 
-  const cwd = (payload.cwd as string) || process.env.CLAUDE_CWD || process.cwd();
-  const workspace = extractWorkspaceName(cwd)!;
-  const tmuxSession = detectSessionName(cwd);
   const sessionId = (payload.session_id as string) || null;
+  const sessionContext = resolveSessionContext({
+    cwd: (payload.cwd as string) || process.env.CLAUDE_CWD || process.cwd(),
+    sessionId,
+  });
+  const cwd = sessionContext.cwd;
+  const workspace = sessionContext.workspace || extractWorkspaceName(cwd)!;
+  const tmuxSession = sessionContext.entry?.tmuxSession || sessionContext.sessionName;
 
   const config = STATUS_CONFIG[STATUS_ARG] ?? STATUS_CONFIG['waiting'];
 
   // Update session map (skip for session-end — session is over)
-  if (config.upsertSession) {
+  if (config.upsertSession && tmuxSession && sessionContext.managed) {
     try {
       upsertSession({
         cwd,
-        tmuxSession: tmuxSession || `claude-${workspace}`,
+        tmuxSession,
         status: STATUS_ARG,
         sessionId,
+        sessionType: sessionContext.sessionType || undefined,
       });
     } catch (err: unknown) {
       logger.error(`Failed to update session map: ${(err as Error).message}`);
     }
   }
 
-  // If the bot injected this command from Telegram, typing-active exists — always notify
-  // so the response goes back to Telegram regardless of terminal activity.
-  // typing-active contains "pty" when written by ccgram's PTY session.
-  // Only non-tmux sessions (PTY) should match — tmux sessions (e.g. mac-mini-dev) should not.
-  const typingActivePath = path.join(PROJECT_ROOT, 'src/data', 'typing-active');
-  // Only consider typing-active if this hook is running INSIDE a tmux session.
-  // process.env.TMUX is set when inside tmux. Sessions started by the user directly
-  // (not via ccgram) run outside tmux, so they must never match.
-  const isInsideTmuxForTyping = !!process.env.TMUX;
-  let isTelegramInjected = false;
-  if (isInsideTmuxForTyping && fs.existsSync(typingActivePath)) {
-    const typingContent = fs.readFileSync(typingActivePath, 'utf8').trim();
-    isTelegramInjected = (typingContent === tmuxSession);
-  }
-
-  // Check if this hook is running inside a ccgram-managed tmux session.
-  // Key insight: process.env.TMUX is only set when running INSIDE a tmux session.
-  // Claude Code sessions started by the user (not via ccgram) run outside tmux,
-  // so process.env.TMUX is empty even though `tmux display-message` may still work.
-  const isInsideTmux = !!process.env.TMUX;
-  let isCcgramSession = false;
-  if (isInsideTmux) {
-    try {
-      const sessionMapPath = path.join(PROJECT_ROOT, 'src/data', 'session-map.json');
-      const sessionMap = JSON.parse(fs.readFileSync(sessionMapPath, 'utf8'));
-      for (const [, entry] of Object.entries(sessionMap)) {
-        if (entry && (entry as any).tmuxSession === tmuxSession) {
-          isCcgramSession = true;
-          break;
-        }
-      }
-    } catch {}
-  }
+  const isTelegramInjected = !!(tmuxSession && isRemoteSessionActive(tmuxSession));
 
   // Only send Telegram notifications from ccgram-managed sessions or Telegram-injected
-  if (!isCcgramSession && !isTelegramInjected) {
-    // Do NOT delete typing-active here — it belongs to another session
+  if (!sessionContext.managed && !isTelegramInjected) {
     return;
   }
 
   // Suppress notification if user is actively at terminal AND this wasn't Telegram-injected
   if (!config.alwaysNotify && !isTelegramInjected && isUserActiveAtTerminal(cwd)) {
-    try { fs.unlinkSync(typingActivePath); } catch {}
     return;
   }
 
   // Send Telegram notification
   if (TELEGRAM_ENABLED && BOT_TOKEN && CHAT_ID) {
+    if (STATUS_ARG === 'waiting' && tmuxSession) {
+      stopRemoteTyping(tmuxSession);
+    }
+
     // Dedup: if a richer prompt (permission/question) is already pending for this
     // workspace, skip the basic "Waiting for input" notification
     if (STATUS_ARG === 'waiting' && hasPendingForWorkspace(workspace)) {
-      try { fs.unlinkSync(typingActivePath); } catch {}
       return;
     }
 
@@ -152,9 +132,6 @@ async function main(): Promise<void> {
         message += `\n\n${markdownToHtml(truncated)}`;
       }
     }
-
-    // Remove typing signal file BEFORE sending
-    try { fs.unlinkSync(typingActivePath); } catch {}
 
     try {
       const result = await sendTelegram(message, 'HTML');
@@ -173,6 +150,10 @@ async function main(): Promise<void> {
         logger.error(`Telegram send failed: ${(err2 as Error).message}`);
       }
     }
+  }
+
+  if (tmuxSession && ['completed', 'session-end', 'subagent-done'].includes(STATUS_ARG)) {
+    clearRemoteSession(tmuxSession);
   }
 }
 
@@ -284,20 +265,6 @@ function readStdin(): Promise<string> {
       }
     }, 500);
   });
-}
-
-function detectSessionName(cwd: string): string | null {
-  // 1. Try tmux (preferred — gives actual session name)
-  if (process.env.TMUX) {
-    try {
-      const { execSync } = require('child_process');
-      return execSync('tmux display-message -p "#S"', { encoding: 'utf8' }).trim();
-    } catch {}
-  }
-  // 2. Derive from CWD — sanitize so it matches PTY handle key format
-  const raw = extractWorkspaceName(cwd);
-  if (!raw) return null;
-  return raw.replace(/[.:\s]/g, '-');
 }
 
 function escapeHtml(text: string): string {
