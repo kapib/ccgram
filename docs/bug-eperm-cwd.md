@@ -61,6 +61,19 @@ try {
 - 操作中にStop hookが発火
 - cwdが無効な状態になっている
 
+## 追加バグ: Claude Code起動時に Unexpected エラー
+
+ccgramが `/new claude-env` でtmuxセッションを作り、Claude Codeを起動しようとした時に：
+
+```
+CCGRAM_SESSION_NAME='claude-env' CCGRAM_SESSION_TYPE='tmux' claude
+error: An unknown error occurred (Unexpected)
+```
+
+Claude Code自体が起動できずクラッシュ。その後tmuxセッションは残り、session-mapには「running」として残るため、次の `/new` が「already running」で弾かれる。
+
+**原因推測:** `CCGRAM_SESSION_NAME` 環境変数がClaude Codeの起動に干渉している可能性。あるいは前回のクラッシュで不整合な状態が残っている。
+
 ## 復旧手順
 
 ```bash
