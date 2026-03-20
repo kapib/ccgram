@@ -96,10 +96,16 @@ async function main(): Promise<void> {
     }
   }
 
-  const isTelegramInjected = !!(tmuxSession && isRemoteSessionActive(tmuxSession));
+  const isTelegramInjected = !!(
+    sessionContext.managed
+    && tmuxSession
+    && isRemoteSessionActive(tmuxSession)
+  );
 
-  // Only send Telegram notifications from ccgram-managed sessions or Telegram-injected
-  if (!sessionContext.managed && !isTelegramInjected) {
+  // Never send notifications from sessions that ccgram does not manage.
+  // Direct terminal sessions can share the same cwd-derived session name as a
+  // ccgram session, so allowing them past this point can leak local replies to Telegram.
+  if (!sessionContext.managed) {
     return;
   }
 
