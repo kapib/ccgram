@@ -121,7 +121,7 @@ async function main(): Promise<void> {
 
   // Only send Telegram notifications from ccgram-managed sessions or Telegram-injected
   if (!isCcgramSession && !isTelegramInjected) {
-    try { fs.unlinkSync(typingActivePath); } catch {}
+    // Do NOT delete typing-active here — it belongs to another session
     return;
   }
 
