@@ -55,6 +55,7 @@ import {
 } from './prompt-bridge';
 import { parseCallbackData } from './src/utils/callback-parser';
 import { ptySessionManager } from './src/utils/pty-session-manager';
+import { buildManagedSessionEnv } from './src/utils/session-env';
 import {
   markRemoteSession,
   stopRemoteTyping,
@@ -76,6 +77,7 @@ import type {
 const logger = new Logger('bot');
 
 const INJECTION_MODE: string = process.env.INJECTION_MODE || 'tmux';
+const CCGRAM_TMUX_SOCKET_NAME: string = process.env.CCGRAM_TMUX_SOCKET_NAME || 'ccgram';
 
 const TMUX_AVAILABLE: boolean = (() => {
   try { execSync('tmux -V', { stdio: 'ignore' }); return true; } catch { return false; }
@@ -202,17 +204,23 @@ function shellEscape(value: string): string {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
 }
 
+function buildTmuxCommand(args: string, options: { dedicated?: boolean; bootstrap?: boolean } = {}): string {
+  const parts = ['tmux'];
+  if (options.dedicated) {
+    parts.push(`-L ${shellEscape(CCGRAM_TMUX_SOCKET_NAME)}`);
+    if (options.bootstrap) {
+      parts.push('-f /dev/null');
+    }
+  }
+  parts.push(args);
+  return parts.join(' ');
+}
+
 function buildClaudeLaunchCommand(
-  sessionName: string,
-  sessionType: 'tmux' | 'pty',
   args: string[] = []
 ): string {
-  const envPrefix = [
-    `CCGRAM_SESSION_NAME=${shellEscape(sessionName)}`,
-    `CCGRAM_SESSION_TYPE=${shellEscape(sessionType)}`,
-  ].join(' ');
   const escapedArgs = args.map(arg => shellEscape(arg)).join(' ');
-  return `${envPrefix} claude${escapedArgs ? ` ${escapedArgs}` : ''}`;
+  return `claude${escapedArgs ? ` ${escapedArgs}` : ''}`;
 }
 
 async function registerBotCommands(): Promise<void> {
@@ -672,10 +680,10 @@ async function startProject(name: string): Promise<void> {
   if (!usePty) {
     // tmux path (existing behaviour)
     try {
-      await tmuxExec(`tmux new-session -d -s "${tmuxName}" -c "${projectDir}"`);
+      await tmuxExec(`new-session -d -s "${tmuxName}" -c "${projectDir}"`, { dedicated: true, bootstrap: true, allowFallback: false });
       await sleep(300);
-      const launchCmd = buildClaudeLaunchCommand(tmuxName, 'tmux');
-      await tmuxExec(`tmux send-keys -t "${tmuxName}" ${shellEscape(launchCmd)} C-m`);
+      const launchCmd = buildClaudeLaunchCommand();
+      await tmuxExecForSession(tmuxName, `send-keys -t "${tmuxName}" ${shellEscape(launchCmd)} C-m`);
     } catch (err: unknown) {
       await sendMessage(`Failed to start session: ${(err as Error).message}`);
       return;
@@ -700,7 +708,7 @@ async function startProject(name: string): Promise<void> {
       tmuxName,
       projectDir,
       [],
-      { CCGRAM_SESSION_NAME: tmuxName, CCGRAM_SESSION_TYPE: 'pty' }
+      buildManagedSessionEnv(tmuxName, 'pty')
     );
     if (!ok) { await sendMessage('Failed to spawn PTY session.'); return; }
 
@@ -905,16 +913,16 @@ async function startProjectResume(name: string, projectDir: string, sessionId: s
     try {
       // Double Ctrl+C: first interrupts any running Claude task,
       // second clears the input line if Claude returned to its prompt
-      await tmuxExec(`tmux send-keys -t "${tmuxName}" C-c`);
+      await tmuxExecForSession(tmuxName, `send-keys -t "${tmuxName}" C-c`);
       await sleep(500);
-      await tmuxExec(`tmux send-keys -t "${tmuxName}" C-c`);
+      await tmuxExecForSession(tmuxName, `send-keys -t "${tmuxName}" C-c`);
       await sleep(500);
       // Exit Claude — if Claude already exited, /exit is harmless in bash
       // (just an unknown command, won't affect the subsequent claude launch)
-      await tmuxExec(`tmux send-keys -t "${tmuxName}" '/exit' C-m`);
+      await tmuxExecForSession(tmuxName, `send-keys -t "${tmuxName}" '/exit' C-m`);
       await sleep(2000);
-      const launchCmd = buildClaudeLaunchCommand(tmuxName, 'tmux', ['--resume', sessionId]);
-      await tmuxExec(`tmux send-keys -t "${tmuxName}" ${shellEscape(launchCmd)} C-m`);
+      const launchCmd = buildClaudeLaunchCommand(['--resume', sessionId]);
+      await tmuxExecForSession(tmuxName, `send-keys -t "${tmuxName}" ${shellEscape(launchCmd)} C-m`);
     } catch (err: unknown) {
       await sendMessage(`Failed to switch session: ${(err as Error).message}`);
       return;
@@ -942,10 +950,10 @@ async function startProjectResume(name: string, projectDir: string, sessionId: s
 
   if (!usePty) {
     try {
-      await tmuxExec(`tmux new-session -d -s "${tmuxName}" -c "${projectDir}"`);
+      await tmuxExec(`new-session -d -s "${tmuxName}" -c "${projectDir}"`, { dedicated: true, bootstrap: true, allowFallback: false });
       await sleep(300);
-      const launchCmd = buildClaudeLaunchCommand(tmuxName, 'tmux', ['--resume', sessionId]);
-      await tmuxExec(`tmux send-keys -t "${tmuxName}" ${shellEscape(launchCmd)} C-m`);
+      const launchCmd = buildClaudeLaunchCommand(['--resume', sessionId]);
+      await tmuxExecForSession(tmuxName, `send-keys -t "${tmuxName}" ${shellEscape(launchCmd)} C-m`);
     } catch (err: unknown) {
       await sendMessage(`Failed to start session: ${(err as Error).message}`);
       return;
@@ -970,7 +978,7 @@ async function startProjectResume(name: string, projectDir: string, sessionId: s
       tmuxName,
       projectDir,
       ['--resume', sessionId],
-      { CCGRAM_SESSION_NAME: tmuxName, CCGRAM_SESSION_TYPE: 'pty' }
+      buildManagedSessionEnv(tmuxName, 'pty')
     );
     if (!ok) { await sendMessage('Failed to spawn PTY session.'); return; }
 
@@ -1016,11 +1024,11 @@ async function injectAndRespond(session: SessionEntry, command: string, workspac
     } else {
       // tmux: existing shell-escaped path
       const escapedCommand: string = command.replace(/'/g, "'\"'\"'");
-      await tmuxExec(`tmux send-keys -t ${tmuxName} C-u`);
+      await tmuxExecForSession(tmuxName, `send-keys -t ${tmuxName} C-u`);
       await sleep(150);
-      await tmuxExec(`tmux send-keys -t ${tmuxName} '${escapedCommand}'`);
+      await tmuxExecForSession(tmuxName, `send-keys -t ${tmuxName} '${escapedCommand}'`);
       await sleep(150);
-      await tmuxExec(`tmux send-keys -t ${tmuxName} C-m`);
+      await tmuxExecForSession(tmuxName, `send-keys -t ${tmuxName} C-m`);
     }
     startTypingIndicator(tmuxName, workspace);
     return true;
@@ -1030,13 +1038,61 @@ async function injectAndRespond(session: SessionEntry, command: string, workspac
   }
 }
 
-function tmuxExec(cmd: string): Promise<boolean> {
+function execShellCommand(cmd: string): Promise<boolean> {
   return new Promise((resolve, reject) => {
     exec(cmd, (err) => {
       if (err) reject(err);
       else resolve(true);
     });
   });
+}
+
+function tmuxPrefixes(): string[] {
+  return [
+    buildTmuxCommand('', { dedicated: true }).trim(),
+    'tmux',
+  ];
+}
+
+async function tmuxExec(
+  args: string,
+  options: { dedicated?: boolean; bootstrap?: boolean; allowFallback?: boolean } = {}
+): Promise<boolean> {
+  const commands = options.allowFallback === false
+    ? [buildTmuxCommand(args, options)]
+    : options.dedicated
+      ? [buildTmuxCommand(args, options), buildTmuxCommand(args)]
+      : [buildTmuxCommand(args)];
+
+  let lastError: unknown;
+  for (const cmd of commands) {
+    try {
+      return await execShellCommand(cmd);
+    } catch (err: unknown) {
+      lastError = err;
+    }
+  }
+
+  throw lastError as Error;
+}
+
+async function tmuxExecForSession(sessionName: string, args: string): Promise<boolean> {
+  const prefix = await resolveTmuxPrefixForSession(sessionName);
+  return execShellCommand(`${prefix} ${args}`);
+}
+
+async function resolveTmuxPrefixForSession(sessionName: string): Promise<string> {
+  let lastError: unknown;
+  for (const prefix of tmuxPrefixes()) {
+    try {
+      await execShellCommand(`${prefix} has-session -t "${sessionName}" 2>/dev/null`);
+      return prefix;
+    } catch (err: unknown) {
+      lastError = err;
+    }
+  }
+
+  throw lastError as Error;
 }
 
 // ── PTY / tmux dispatch helpers ──────────────────────────────────
@@ -1050,7 +1106,7 @@ function isPtySession(sessionName: string): boolean {
 async function sessionExists(name: string): Promise<boolean> {
   if (ptySessionManager.has(name)) return true;
   if (TMUX_AVAILABLE) {
-    try { await tmuxExec(`tmux has-session -t ${name} 2>/dev/null`); return true; }
+    try { await resolveTmuxPrefixForSession(name); return true; }
     catch { return false; }
   }
   return false;
@@ -1065,7 +1121,7 @@ async function sessionSendKey(name: string, key: string): Promise<void> {
   if (isPtySession(name)) {
     ptySessionManager.sendKey(name, key);
   } else {
-    await tmuxExec(`tmux send-keys -t ${name} ${key}`);
+    await tmuxExecForSession(name, `send-keys -t ${name} ${key}`);
   }
   await sleep(100);
 }
@@ -1079,7 +1135,7 @@ async function sessionCaptureOutput(name: string): Promise<string> {
 /** Send Ctrl+C interrupt to a session. */
 async function sessionInterrupt(name: string): Promise<void> {
   if (isPtySession(name)) ptySessionManager.interrupt(name);
-  else await tmuxExec(`tmux send-keys -t ${name} C-c`);
+  else await tmuxExecForSession(name, `send-keys -t ${name} C-c`);
 }
 
 /** Icon for /sessions listing based on session type and live status. */
@@ -1543,10 +1599,14 @@ async function poll(): Promise<void> {
 
 function capturePane(tmuxSession: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    exec(`tmux capture-pane -t ${tmuxSession} -p`, (err, stdout) => {
-      if (err) reject(err);
-      else resolve(stdout);
-    });
+    resolveTmuxPrefixForSession(tmuxSession)
+      .then((prefix) => {
+        exec(`${prefix} capture-pane -t ${tmuxSession} -p`, (err, stdout) => {
+          if (err) reject(err);
+          else resolve(stdout);
+        });
+      })
+      .catch(reject);
   });
 }
 

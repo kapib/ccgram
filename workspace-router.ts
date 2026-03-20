@@ -15,6 +15,7 @@ import path from 'path';
 import { PROJECT_ROOT } from './src/utils/paths';
 require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env'), quiet: true });
 import Logger from './src/core/logger';
+import { normalizeExistingPath } from './src/utils/path-normalize';
 import type {
   SessionEntry,
   SessionMap,
@@ -142,14 +143,15 @@ function upsertSession({ cwd, tmuxSession, status, sessionId, sessionType }: {
   sessionType?: 'tmux' | 'pty';
 }): { token: string; workspace: string | null } {
   const map = readSessionMap();
-  const workspace = extractWorkspaceName(cwd);
+  const normalizedCwd = normalizeExistingPath(cwd) || cwd;
+  const workspace = extractWorkspaceName(normalizedCwd);
   const now = Math.floor(Date.now() / 1000);
   const expiresAt = now + SESSION_TIMEOUT_HOURS * 3600;
 
   // Try to find an existing session for this workspace + tmux combo
   let existingToken: string | null = null;
   for (const [token, sess] of Object.entries(map)) {
-    if (sess.cwd === cwd && sess.tmuxSession === tmuxSession && !isExpired(sess)) {
+    if (normalizeExistingPath(sess.cwd) === normalizedCwd && sess.tmuxSession === tmuxSession && !isExpired(sess)) {
       existingToken = token;
       break;
     }
@@ -165,14 +167,14 @@ function upsertSession({ cwd, tmuxSession, status, sessionId, sessionType }: {
     ...(resolvedSessionType !== undefined ? { sessionType: resolvedSessionType } : {}),
     createdAt: existingToken ? map[existingToken].createdAt : now,
     expiresAt,
-    cwd,
+    cwd: normalizedCwd,
     sessionId: sessionId || (existingToken ? map[existingToken].sessionId : null) || null,
     tmuxSession: tmuxSession || `claude-${workspace}`,
     description: `${status} - ${workspace}`,
   };
 
   writeSessionMap(map);
-  recordProjectUsage(workspace!, cwd, sessionId ?? undefined);
+  recordProjectUsage(workspace!, normalizedCwd, sessionId ?? undefined);
   return { token, workspace };
 }
 
@@ -351,6 +353,7 @@ const MAX_SESSION_HISTORY = 5;
 
 function recordProjectUsage(name: string, projectPath: string, sessionId?: string | null): void {
   const history = readProjectHistory();
+  const normalizedProjectPath = normalizeExistingPath(projectPath) || projectPath;
   const existing = history[name];
   const existingSessions: SessionHistoryEntry[] = existing?.sessions || [];
 
@@ -364,7 +367,7 @@ function recordProjectUsage(name: string, projectPath: string, sessionId?: strin
     sessions = existingSessions;
   }
 
-  history[name] = { path: projectPath, lastUsed: Date.now(), sessions };
+  history[name] = { path: normalizedProjectPath, lastUsed: Date.now(), sessions };
   const entries = Object.entries(history).sort((a, b) => b[1].lastUsed - a[1].lastUsed);
   const trimmed = Object.fromEntries(entries.slice(0, 50));
   const dir = path.dirname(PROJECT_HISTORY_PATH);

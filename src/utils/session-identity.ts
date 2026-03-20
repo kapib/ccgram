@@ -5,6 +5,8 @@ import {
   isExpired,
 } from '../../workspace-router';
 import type { SessionEntry } from '../types';
+import { normalizeExistingPath } from './path-normalize';
+import { readManagedSessionEnv } from './session-env';
 
 export interface SessionContext {
   cwd: string;
@@ -27,7 +29,7 @@ function normalizeSessionType(value?: string | null): 'tmux' | 'pty' | null {
 }
 
 export function detectSessionName(cwd?: string | null): string | null {
-  const envName = process.env.CCGRAM_SESSION_NAME;
+  const { sessionName: envName } = readManagedSessionEnv();
   if (envName) return envName;
 
   if (process.env.TMUX) {
@@ -45,7 +47,8 @@ export function detectSessionName(cwd?: string | null): string | null {
 }
 
 export function detectSessionType(): 'tmux' | 'pty' | null {
-  return normalizeSessionType(process.env.CCGRAM_SESSION_TYPE)
+  const { sessionType } = readManagedSessionEnv();
+  return normalizeSessionType(sessionType)
     || (process.env.TMUX ? 'tmux' : null);
 }
 
@@ -56,12 +59,16 @@ export function resolveSessionContext({
   cwd?: string | null;
   sessionId?: string | null;
 } = {}): SessionContext {
-  const resolvedCwd = cwd || process.env.CLAUDE_CWD || process.cwd();
+  const resolvedCwd = normalizeExistingPath(cwd || process.env.CLAUDE_CWD || process.cwd())
+    || cwd
+    || process.env.CLAUDE_CWD
+    || process.cwd();
   const resolvedSessionId = sessionId || null;
   const sessionName = detectSessionName(resolvedCwd);
   const runtimeSessionType = detectSessionType();
   const workspace = extractWorkspaceName(resolvedCwd);
   const map = readSessionMap();
+  const { sessionName: envSessionName } = readManagedSessionEnv();
 
   let token: string | null = null;
   let entry: SessionEntry | null = null;
@@ -77,11 +84,11 @@ export function resolveSessionContext({
     }
   }
 
-  if (!entry && process.env.CCGRAM_SESSION_NAME && sessionName) {
+  if (!entry && envSessionName && sessionName) {
     for (const [candidateToken, candidate] of Object.entries(map)) {
       if (isExpired(candidate)) continue;
       if (candidate.tmuxSession !== sessionName) continue;
-      if (candidate.cwd !== resolvedCwd) continue;
+      if ((normalizeExistingPath(candidate.cwd) || candidate.cwd) !== resolvedCwd) continue;
       token = candidateToken;
       entry = candidate;
       break;
@@ -96,14 +103,14 @@ export function resolveSessionContext({
       if (isExpired(candidate)) continue;
       if ((candidate.sessionType || 'tmux') !== 'tmux') continue;
       if (candidate.tmuxSession !== sessionName) continue;
-      if (candidate.cwd !== resolvedCwd) continue;
+      if ((normalizeExistingPath(candidate.cwd) || candidate.cwd) !== resolvedCwd) continue;
       token = candidateToken;
       entry = candidate;
       break;
     }
   }
 
-  const managed = !!process.env.CCGRAM_SESSION_NAME || !!entry;
+  const managed = !!envSessionName || !!entry;
 
   return {
     cwd: resolvedCwd,

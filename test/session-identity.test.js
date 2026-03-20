@@ -20,15 +20,17 @@ afterEach(() => {
   fs.rmSync(testDir, { recursive: true, force: true });
   delete process.env.SESSION_MAP_PATH;
   delete process.env.CCGRAM_DATA_DIR;
+  delete process.env.CCGRAM_MANAGED_SESSION_NAME;
+  delete process.env.CCGRAM_MANAGED_SESSION_TYPE;
   delete process.env.CCGRAM_SESSION_NAME;
   delete process.env.CCGRAM_SESSION_TYPE;
   delete process.env.TMUX;
 });
 
 describe('resolveSessionContext', () => {
-  it('treats env-tagged sessions as managed', () => {
-    process.env.CCGRAM_SESSION_NAME = 'claude-demo';
-    process.env.CCGRAM_SESSION_TYPE = 'pty';
+  it('treats managed-session env tagged sessions as managed', () => {
+    process.env.CCGRAM_MANAGED_SESSION_NAME = 'claude-demo';
+    process.env.CCGRAM_MANAGED_SESSION_TYPE = 'pty';
 
     const ctx = identity.resolveSessionContext({
       cwd: '/tmp/projects/demo',
@@ -38,6 +40,19 @@ describe('resolveSessionContext', () => {
     expect(ctx.managed).toBe(true);
     expect(ctx.sessionName).toBe('claude-demo');
     expect(ctx.sessionType).toBe('pty');
+  });
+
+  it('keeps legacy session env tags as a fallback', () => {
+    process.env.CCGRAM_SESSION_NAME = 'legacy-demo';
+    process.env.CCGRAM_SESSION_TYPE = 'tmux';
+
+    const ctx = identity.resolveSessionContext({
+      cwd: '/tmp/projects/demo',
+    });
+
+    expect(ctx.managed).toBe(true);
+    expect(ctx.sessionName).toBe('legacy-demo');
+    expect(ctx.sessionType).toBe('tmux');
   });
 
   it('matches a tracked session by session_id', () => {
@@ -70,6 +85,29 @@ describe('resolveSessionContext', () => {
 
     const ctx = identity.resolveSessionContext({
       cwd: '/tmp/projects/demo',
+    });
+
+    expect(ctx.managed).toBe(true);
+    expect(ctx.entry?.tmuxSession).toBe('demo');
+  });
+
+  it('matches tracked tmux sessions even when cwd casing differs', () => {
+    process.env.TMUX = '/tmp/tmux-501/default,123,0';
+    vi.spyOn(fs.realpathSync, 'native').mockImplementation((input) => {
+      if (input === '/tmp/projects/Github/demo') return '/tmp/projects/GitHub/demo';
+      if (input === '/tmp/projects/GitHub/demo') return '/tmp/projects/GitHub/demo';
+      return input;
+    });
+
+    router.upsertSession({
+      cwd: '/tmp/projects/Github/demo',
+      tmuxSession: 'demo',
+      status: 'waiting',
+      sessionType: 'tmux',
+    });
+
+    const ctx = identity.resolveSessionContext({
+      cwd: '/tmp/projects/GitHub/demo',
     });
 
     expect(ctx.managed).toBe(true);
