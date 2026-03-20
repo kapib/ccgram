@@ -85,3 +85,12 @@ launchctl kickstart -k gui/$(id -u)/com.ccgram
 ```
 
 **注意:** 修正がデプロイされるまで、Telegramからのセッション起動は不可能。
+
+## 追加情報（2026-03-20 20:00）
+
+- ビルド+rsyncで全distコピー済み。MODULE_NOT_FOUNDは解消。
+- しかしtmuxセッション内で `claude`（環境変数なし）を打っても同じエラー。
+- **Ghosttyから直接 `claude` を打つと正常に起動する。**
+- つまりtmuxセッション内の環境に問題がある。
+- `tmux show-environment` にはCCGRAM_*は無い。
+- ccgramが `tmux new-session` で作ったセッション内でだけ起動不能。シェル環境かPATHか何かが壊れてる可能性。
