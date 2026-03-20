@@ -118,7 +118,70 @@ if (!isCcgramSession && !isTelegramInjected) {
 - ユーザーがtmuxでセッション名 `claude-env` を使う → **ccgramのセッションと競合する可能性あり**
 - ccgram再起動時はsession-map + typing-active + tmux claude-envをクリアしてから `/new claude-env`
 
+## レビュー依頼事項
+
+以下の観点でレビューをお願いしたい。
+
+### 1. inject APIのセキュリティ
+
+- 現状: `INJECT_TOKEN` 環境変数で認証。localhost（127.0.0.1）のみバインド
+- 懸念: トークンがハードコードされている（launchd plistとkuro-daemon.shの両方）。ローテーションの仕組みがない
+- 質問: これで十分か？ローカル通信のみだから問題ない？
+
+### 2. typing-activeファイルの競合
+
+- 現状: ファイルベースIPC。1ファイルに1セッション名。対象外セッションは触らない
+- 懸念: 複数のccgram管理セッションが同時に動いた場合（将来）、typing-activeが上書きされる
+- 質問: 現時点ではclaude-envの1セッションだけなので問題ないが、将来的にはセッションIDベースにすべきか？
+
+### 3. process.env.TMUX 依存
+
+- 現状: tmux内かどうかの判定に `process.env.TMUX` を使用
+- 懸念: ユーザーがtmux内でClaude Codeを起動し、セッション名が `claude-env` だった場合に競合
+- 質問: tmuxセッション名の予約（ccgramが使う名前をユーザーが使わないようにする）を明示すべきか？
+
+### 4. ccgram再起動時の手順
+
+- 現状: 手動でsession-map + typing-active + tmuxセッションをクリアしてから `/new`
+- 懸念: 自動化されてない。忘れると「already running」で詰まる
+- 質問: ccgram起動時に自動クリーンアップすべきか？
+
+### 5. enhanced-hook-notifyの変更範囲
+
+- 元のccgramの設計: typing-activeの存在だけで判定（シンプル）
+- 改造後: 3層判定（process.env.TMUX + session-map + typing-active内容照合）
+- 懸念: 元のシンプルな設計から複雑化した。元のccgramがアップデートされた時にコンフリクトする可能性
+- 質問: upstream（元のccgram）にPRを出すべきか、forkとして維持すべきか？
+
+## 発生したバグの時系列
+
+| # | 症状 | 原因 | 修正 |
+|---|------|------|------|
+| 1 | injectしたメッセージがワイのセッション（mac-mini-dev）に注入される | tmux send-keysで `claude-env` を指定 → ワイのtmuxセッションがclaude-envだった | inject APIに切り替え（tmux send-keys廃止） |
+| 2 | ワイの発言がTelegramに漏れる | enhanced-hook-notifyがtyping-active存在だけで判定 → 全セッションから送信 | process.env.TMUX + session-mapチェック追加 |
+| 3 | inject後にクロスケの応答がTelegramに来ない | `process.env.TMUX`が空の時もdetectSessionNameがcwdから`claude-env`を返す → typing-active照合が誤一致 | tmux外ではtyping-activeを一切見ないように修正 |
+| 4 | inject後にクロスケの応答が来たり来なかったり（不安定） | ワイのセッションのhookが先に発火してtyping-activeを削除 → Telegramセッションのhookがファイルを見つけられない | 対象外セッションはtyping-activeを触らないように修正 |
+| 5 | tmux attach中にTelegram送信が不安定 | コピーモードONやキー入力がClaude Codeの応答に影響 | `tmux attach -r`（読み取り専用）を使用 |
+
+## テスト結果
+
+| テスト | 結果 |
+|--------|------|
+| inject → クロスケ応答 → Telegram送信 | ✅（再起動3回連続成功） |
+| ワイの発言漏れ防止 | ✅ |
+| スマホからTelegram直接送信 → 応答 | ✅ |
+| tmux attach -r 中のinject | ✅ |
+| ccgram再起動後の復旧 | ✅（session-mapクリア + /new必要） |
+
+## 未テスト・既知のリスク
+
+- MacBookからの同時セッション（Mac miniとMacBookで同時にclaude-envを使う場合）
+- node-ptyが使える環境での動作（現在はtmuxモードのみ検証）
+- 長時間連続運用（24時間以上）
+- kuro-daemon本番版（haiku判断あり）でのinject
+
 ## 関連コミット
 
 - `8e9af87` — feat: kuro-daemon用inject APIとTelegram通知セッション分離
 - `0536018` — fix: typing-active競合修正 — 対象外セッションがファイルを削除しない
+- `c2fdad4` — docs: kuro-daemon連携の改造ドキュメント
