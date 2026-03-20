@@ -22,6 +22,7 @@ afterEach(() => {
   delete process.env.CCGRAM_DATA_DIR;
   delete process.env.CCGRAM_SESSION_NAME;
   delete process.env.CCGRAM_SESSION_TYPE;
+  delete process.env.TMUX;
 });
 
 describe('resolveSessionContext', () => {
@@ -56,5 +57,22 @@ describe('resolveSessionContext', () => {
     expect(ctx.managed).toBe(true);
     expect(ctx.entry?.tmuxSession).toBe('claude-demo');
     expect(ctx.sessionType).toBe('tmux');
+  });
+
+  it('falls back to tmux session-map matching when env tag is missing', () => {
+    process.env.TMUX = '/tmp/tmux-501/default,123,0';
+    router.upsertSession({
+      cwd: '/tmp/projects/demo',
+      tmuxSession: 'demo',
+      status: 'waiting',
+      sessionType: 'tmux',
+    });
+
+    const ctx = identity.resolveSessionContext({
+      cwd: '/tmp/projects/demo',
+    });
+
+    expect(ctx.managed).toBe(true);
+    expect(ctx.entry?.tmuxSession).toBe('demo');
   });
 });

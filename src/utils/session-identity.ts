@@ -32,7 +32,10 @@ export function detectSessionName(cwd?: string | null): string | null {
 
   if (process.env.TMUX) {
     try {
-      return execSync('tmux display-message -p "#S"', { encoding: 'utf8' }).trim();
+      return execSync('tmux display-message -p "#S"', {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
     } catch {}
   }
 
@@ -77,6 +80,21 @@ export function resolveSessionContext({
   if (!entry && process.env.CCGRAM_SESSION_NAME && sessionName) {
     for (const [candidateToken, candidate] of Object.entries(map)) {
       if (isExpired(candidate)) continue;
+      if (candidate.tmuxSession !== sessionName) continue;
+      if (candidate.cwd !== resolvedCwd) continue;
+      token = candidateToken;
+      entry = candidate;
+      break;
+    }
+  }
+
+  // Fallback for ccgram-managed tmux sessions when hook subprocesses do not
+  // preserve CCGRAM_SESSION_NAME. Only trust tmux-backed matches here so a
+  // direct terminal session with the same cwd-derived name does not get marked managed.
+  if (!entry && process.env.TMUX && sessionName) {
+    for (const [candidateToken, candidate] of Object.entries(map)) {
+      if (isExpired(candidate)) continue;
+      if ((candidate.sessionType || 'tmux') !== 'tmux') continue;
       if (candidate.tmuxSession !== sessionName) continue;
       if (candidate.cwd !== resolvedCwd) continue;
       token = candidateToken;
