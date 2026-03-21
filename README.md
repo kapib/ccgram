@@ -27,6 +27,7 @@ Claude Code  →  ccgram hooks  →  Telegram bot  →  📱 your phone
 - **Question answering** — Select from Claude's options via inline buttons (single and multi-select)
 - **Smart notifications** — Task completions, session start/end, and subagent activity — silent when you're at your terminal, instant when you're away
 - **Remote command routing** — Send any command to any Claude session from Telegram
+- **Telegram photo input** — Send a photo from Telegram and route its local file path into Claude Code
 - **Session management** — List, switch between, and interrupt active sessions
 - **Resume conversations** — `/resume` reads your full Claude Code session history with conversation snippets — pick up any past conversation in one tap
 - **Project launcher** — Start Claude in any project directory with `/new myproject`
@@ -150,6 +151,8 @@ Each session shows a snippet of the first message for easy identification. Sessi
 **Reply-to routing** — reply to any bot notification (permission, question, or status message) to route your reply to that workspace.
 
 **Default workspace** — after `/use myproject`, plain text messages route there automatically.
+
+**Photo routing** — send a Telegram photo with an optional caption and CCGram downloads it to `/tmp/ccgram-images/`, then injects the local file path into the target Claude session.
 
 ## Configuration
 

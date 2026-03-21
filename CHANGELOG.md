@@ -2,6 +2,16 @@
 
 All notable changes to CCGram are documented here.
 
+## [Unreleased]
+
+### Features
+- **Telegram photo receive** — photo messages are now downloaded to `/tmp/ccgram-images/` and routed into Claude Code as local file paths, with captions preserved
+
+### Docs
+- Added implementation notes for Telegram photo receive flow and verification
+
+---
+
 ## [1.1.0] - 2026-02-24
 
 ### Features

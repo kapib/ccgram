@@ -19,12 +19,22 @@ export interface TelegramChat {
   last_name?: string;
 }
 
+export interface PhotoSize {
+  file_id: string;
+  file_unique_id: string;
+  width: number;
+  height: number;
+  file_size?: number;
+}
+
 export interface TelegramMessage {
   message_id: number;
   from?: TelegramUser;
   chat: TelegramChat;
   date: number;
   text?: string;
+  caption?: string;
+  photo?: PhotoSize[];
   reply_to_message?: TelegramMessage;
 }
 

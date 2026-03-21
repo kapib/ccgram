@@ -102,6 +102,7 @@ let lastUpdateId: number = 0;
 let lastPollTime: number | null = null;   // timestamp of last successful getUpdates call
 const startTime: number = Date.now();
 const activeTypingIntervals: Map<string, { intervalId: NodeJS.Timeout; timeoutId: NodeJS.Timeout }> = new Map();
+const TELEGRAM_IMAGE_DIR: string = '/tmp/ccgram-images';
 
 // ── Telegram API helpers ────────────────────────────────────────
 
@@ -161,6 +162,99 @@ function sendHtmlMessage(text: string): Promise<unknown> {
     text,
     parse_mode: 'HTML',
   });
+}
+
+function ensureTelegramImageDir(): void {
+  if (!fs.existsSync(TELEGRAM_IMAGE_DIR)) {
+    fs.mkdirSync(TELEGRAM_IMAGE_DIR, { recursive: true });
+  }
+}
+
+function sanitizeTelegramFileName(filePath: string, fallbackId: string): string {
+  const baseName: string = path.basename(filePath || fallbackId);
+  return baseName.replace(/[^A-Za-z0-9._-]/g, '_') || `${fallbackId}.jpg`;
+}
+
+async function downloadTelegramPhoto(fileId: string): Promise<string> {
+  const result = await telegramAPI('getFile', { file_id: fileId }) as { file_path?: string };
+  const remotePath: string | undefined = result.file_path;
+
+  if (!remotePath) {
+    throw new Error('Telegram getFile returned no file_path');
+  }
+
+  ensureTelegramImageDir();
+
+  const fileName: string = `${Date.now()}-${sanitizeTelegramFileName(remotePath, fileId)}`;
+  const localPath: string = path.join(TELEGRAM_IMAGE_DIR, fileName);
+
+  await new Promise<void>((resolve, reject) => {
+    const file = fs.createWriteStream(localPath);
+    const req = https.get(`https://api.telegram.org/file/bot${BOT_TOKEN}/${remotePath}`, (res) => {
+      if ((res.statusCode || 0) >= 400) {
+        file.close(() => {
+          fs.rmSync(localPath, { force: true });
+        });
+        reject(new Error(`Telegram file download failed with status ${res.statusCode}`));
+        return;
+      }
+
+      res.pipe(file);
+      file.on('finish', () => {
+        file.close((err?: Error | null) => {
+          if (err) {
+            reject(err);
+            return;
+          }
+          resolve();
+        });
+      });
+    });
+
+    req.on('error', (err) => {
+      file.close(() => {
+        fs.rmSync(localPath, { force: true });
+      });
+      reject(err);
+    });
+
+    file.on('error', (err) => {
+      req.destroy(err);
+      file.close(() => {
+        fs.rmSync(localPath, { force: true });
+      });
+      reject(err);
+    });
+  });
+
+  return localPath;
+}
+
+function selectLargestPhoto(photos: NonNullable<TelegramMessage['photo']>): NonNullable<TelegramMessage['photo']>[number] {
+  return photos.reduce((largest, current) => {
+    const largestSize = largest.file_size || (largest.width * largest.height);
+    const currentSize = current.file_size || (current.width * current.height);
+    return currentSize > largestSize ? current : largest;
+  });
+}
+
+async function routeIncomingMessage(msg: TelegramMessage, command: string): Promise<void> {
+  const replyToId: number | undefined = msg.reply_to_message && msg.reply_to_message.message_id;
+  if (replyToId) {
+    const replyWorkspace: string | null = getWorkspaceForMessage(replyToId);
+    if (replyWorkspace) {
+      await handleWorkspaceCommand(replyWorkspace, command);
+      return;
+    }
+  }
+
+  const defaultWs: string | null = getDefaultWorkspace();
+  if (defaultWs) {
+    await handleWorkspaceCommand(defaultWs, command);
+    return;
+  }
+
+  await sendMessage('Use `/help` to see available commands, or `/use <workspace>` to set a default.');
 }
 
 function startTypingIndicator(sessionName?: string, workspace?: string): void {
@@ -1444,6 +1538,24 @@ async function processMessage(msg: TelegramMessage): Promise<void> {
     return;
   }
 
+  if (msg.photo && msg.photo.length > 0) {
+    try {
+      const largestPhoto = selectLargestPhoto(msg.photo);
+      const localPath: string = await downloadTelegramPhoto(largestPhoto.file_id);
+      const caption: string = (msg.caption || '').trim();
+      const prompt: string = caption
+        ? `${caption}\n\n画像: ${localPath}`
+        : `この画像を確認してください。\n\n画像: ${localPath}`;
+
+      logger.info(`Received photo: ${localPath}`);
+      await routeIncomingMessage(msg, prompt);
+    } catch (err: unknown) {
+      logger.error(`Failed to process incoming photo: ${(err as Error).message}`);
+      await sendMessage(`画像の受信に失敗しました: ${(err as Error).message}`);
+    }
+    return;
+  }
+
   const text: string = (msg.text || '').trim();
   if (!text) return;
 
@@ -1539,22 +1651,7 @@ async function processMessage(msg: TelegramMessage): Promise<void> {
   }
 
   // Plain text — try reply-to routing, then default workspace, then show hint
-  const replyToId: number | undefined = msg.reply_to_message && msg.reply_to_message.message_id;
-  if (replyToId) {
-    const replyWorkspace: string | null = getWorkspaceForMessage(replyToId);
-    if (replyWorkspace) {
-      await handleWorkspaceCommand(replyWorkspace, text);
-      return;
-    }
-  }
-
-  const defaultWs: string | null = getDefaultWorkspace();
-  if (defaultWs) {
-    await handleWorkspaceCommand(defaultWs, text);
-    return;
-  }
-
-  await sendMessage('Use `/help` to see available commands, or `/use <workspace>` to set a default.');
+  await routeIncomingMessage(msg, text);
 }
 
 // ── Long polling loop ───────────────────────────────────────────
