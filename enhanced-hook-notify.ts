@@ -495,7 +495,19 @@ function markdownToHtml(text: string): string {
 
 // ── Run ─────────────────────────────────────────────────────────
 
-main().catch((err: Error) => {
-  logger.error(`Fatal: ${err.message}`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err: Error) => {
+    logger.error(`Fatal: ${err.message}`);
+    process.exit(1);
+  });
+}
+
+export {
+  getResponseText,
+  extractLastResponse,
+  getTranscriptCandidates,
+  resolveTranscriptPath,
+  isRealUserPrompt,
+  extractAssistantTexts,
+  extractTextFromLastAssistantMessage,
+};
