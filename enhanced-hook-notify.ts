@@ -37,6 +37,7 @@ const logger = new Logger('hook:enhanced');
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const TELEGRAM_ENABLED = process.env.TELEGRAM_ENABLED === 'true';
+const TELEGRAM_MESSAGE_LIMIT = 4096;
 
 const STATUS_ARG = process.argv[2] || 'completed';
 
@@ -126,34 +127,38 @@ async function main(): Promise<void> {
       return;
     }
 
-    let message = `${config.icon} ${config.label} in <b>${escapeHtml(workspace)}</b>`;
+    const messageHeaderHtml = `${config.icon} ${config.label} in <b>${escapeHtml(workspace)}</b>`;
+    const messageHeaderPlain = `${config.icon} ${config.label} in ${workspace}`;
+    const messages: Array<{ html: string; plain: string }> = [];
 
     // Append Claude's last response text (skip for session-start — nothing said yet)
     if (STATUS_ARG !== 'session-start') {
       const responseText = getResponseText(payload);
       if (responseText) {
-        const truncated = responseText.length > 3500
-          ? responseText.slice(0, 3497) + '...'
-          : responseText;
-        message += `\n\n${markdownToHtml(truncated)}`;
+        messages.push(...buildTelegramMessages(messageHeaderHtml, messageHeaderPlain, responseText));
       }
     }
 
-    try {
-      const result = await sendTelegram(message, 'HTML');
-      if (result && result.message_id) {
-        trackNotificationMessage(result.message_id, workspace, `hook-${STATUS_ARG}`);
-      }
-    } catch {
-      // HTML failed — send as plain text
+    if (messages.length === 0) {
+      messages.push({ html: messageHeaderHtml, plain: messageHeaderPlain });
+    }
+
+    for (const [index, message] of messages.entries()) {
       try {
-        const plain = message.replace(/<[^>]+>/g, '');
-        const result = await sendTelegram(plain, false);
+        const result = await sendTelegram(message.html, 'HTML');
         if (result && result.message_id) {
           trackNotificationMessage(result.message_id, workspace, `hook-${STATUS_ARG}`);
         }
-      } catch (err2: unknown) {
-        logger.error(`Telegram send failed: ${(err2 as Error).message}`);
+      } catch {
+        // HTML failed — send as plain text
+        try {
+          const result = await sendTelegram(message.plain, false);
+          if (result && result.message_id) {
+            trackNotificationMessage(result.message_id, workspace, `hook-${STATUS_ARG}`);
+          }
+        } catch (err2: unknown) {
+          logger.error(`Telegram send failed for chunk ${index + 1}: ${(err2 as Error).message}`);
+        }
       }
     }
   }
@@ -166,24 +171,30 @@ async function main(): Promise<void> {
 // ── Response text extraction ─────────────────────────────────────
 
 /**
- * Get Claude's last response text from the hook payload.
- * Prefers last_assistant_message (v2.1.47+), falls back to transcript parsing.
+ * Get Claude's full response text from the hook payload.
+ * Prefers transcript parsing so multiple text blocks separated by tool calls
+ * are preserved, then falls back to last_assistant_message when needed.
  * For SubagentStop, also tries agent_transcript_path.
  */
 function getResponseText(payload: Record<string, unknown>): string | null {
-  // Direct field — available in Claude Code v2.1.47+
-  const direct = payload.last_assistant_message as string | undefined;
-  if (direct) return direct;
-
-  // Transcript fallback for older Claude Code versions
   const agentTranscript = payload.agent_transcript_path as string | undefined;
   if (agentTranscript) {
-    try { return extractLastResponse(agentTranscript); } catch {}
+    try {
+      const response = extractLastResponse(agentTranscript);
+      if (response) return response;
+    } catch {}
   }
   const transcript = payload.transcript_path as string | undefined;
   if (transcript) {
-    try { return extractLastResponse(transcript); } catch {}
+    try {
+      const response = extractLastResponse(transcript);
+      if (response) return response;
+    } catch {}
   }
+
+  const direct = payload.last_assistant_message as string | undefined;
+  if (direct) return direct;
+
   return null;
 }
 
@@ -245,12 +256,78 @@ function extractLastResponse(transcriptPath: string): string | null {
       if (entry.type === 'assistant' && entry.message?.content) {
         const texts = entry.message.content
           .filter((c: Record<string, unknown>) => c.type === 'text')
-          .map((c: Record<string, unknown>) => c.text);
+          .map((c: Record<string, unknown>) => typeof c.text === 'string' ? c.text.trim() : '')
+          .filter((text: string) => text.length > 0);
         if (texts.length > 0) return texts.join('\n\n');
       }
     } catch {}
   }
   return null;
+}
+
+function buildTelegramMessages(
+  headerHtml: string,
+  headerPlain: string,
+  responseText: string
+): Array<{ html: string; plain: string }> {
+  const reserved = Math.max(headerHtml.length, headerPlain.length) + 2;
+  const firstChunkLimit = Math.max(500, TELEGRAM_MESSAGE_LIMIT - reserved);
+  const responseChunks = splitTextForTelegram(responseText, firstChunkLimit, TELEGRAM_MESSAGE_LIMIT);
+
+  return responseChunks.map((chunk, index) => {
+    if (index === 0) {
+      return {
+        html: `${headerHtml}\n\n${markdownToHtml(chunk)}`,
+        plain: `${headerPlain}\n\n${chunk}`,
+      };
+    }
+
+    return {
+      html: markdownToHtml(chunk),
+      plain: chunk,
+    };
+  });
+}
+
+function splitTextForTelegram(text: string, firstLimit: number, nextLimit: number): string[] {
+  const normalized = text.trim();
+  if (!normalized) return [];
+
+  const chunks: string[] = [];
+  let remaining = normalized;
+  let limit = firstLimit;
+
+  while (remaining.length > limit) {
+    const splitAt = findSplitPoint(remaining, limit);
+    chunks.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trim();
+    limit = nextLimit;
+  }
+
+  if (remaining) {
+    chunks.push(remaining);
+  }
+
+  return chunks;
+}
+
+function findSplitPoint(text: string, limit: number): number {
+  const paragraphBreak = text.lastIndexOf('\n\n', limit);
+  if (paragraphBreak >= Math.floor(limit * 0.5)) {
+    return paragraphBreak;
+  }
+
+  const lineBreak = text.lastIndexOf('\n', limit);
+  if (lineBreak >= Math.floor(limit * 0.5)) {
+    return lineBreak;
+  }
+
+  const spaceBreak = text.lastIndexOf(' ', limit);
+  if (spaceBreak >= Math.floor(limit * 0.5)) {
+    return spaceBreak;
+  }
+
+  return limit;
 }
 
 function readStdin(): Promise<string> {
