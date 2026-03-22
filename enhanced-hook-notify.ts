@@ -16,6 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { PROJECT_ROOT } from './src/utils/paths';
 require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env'), quiet: true });
 
@@ -133,7 +134,7 @@ async function main(): Promise<void> {
 
     // Append Claude's last response text (skip for session-start — nothing said yet)
     if (STATUS_ARG !== 'session-start') {
-      const responseText = getResponseText(payload);
+      const responseText = getResponseText(payload, cwd, sessionId);
       if (responseText) {
         messages.push(...buildTelegramMessages(messageHeaderHtml, messageHeaderPlain, responseText));
       }
@@ -176,23 +177,21 @@ async function main(): Promise<void> {
  * are preserved, then falls back to last_assistant_message when needed.
  * For SubagentStop, also tries agent_transcript_path.
  */
-function getResponseText(payload: Record<string, unknown>): string | null {
-  const agentTranscript = payload.agent_transcript_path as string | undefined;
-  if (agentTranscript) {
+function getResponseText(
+  payload: Record<string, unknown>,
+  cwd?: string | null,
+  sessionId?: string | null,
+): string | null {
+  for (const transcriptPath of getTranscriptCandidates(payload, cwd, sessionId)) {
     try {
-      const response = extractLastResponse(agentTranscript);
+      const response = extractLastResponse(transcriptPath);
       if (response) return response;
-    } catch {}
-  }
-  const transcript = payload.transcript_path as string | undefined;
-  if (transcript) {
-    try {
-      const response = extractLastResponse(transcript);
-      if (response) return response;
-    } catch {}
+    } catch (err: unknown) {
+      logger.debug(`Transcript parse failed for ${transcriptPath}: ${(err as Error).message}`);
+    }
   }
 
-  const direct = payload.last_assistant_message as string | undefined;
+  const direct = extractTextFromLastAssistantMessage(payload.last_assistant_message);
   if (direct) return direct;
 
   return null;
@@ -249,20 +248,133 @@ function sendTelegram(text: string, parseMode: string | false = 'Markdown'): Pro
 
 function extractLastResponse(transcriptPath: string): string | null {
   const data = fs.readFileSync(transcriptPath, 'utf8').trimEnd();
-  const lines = data.split('\n');
-  for (let i = lines.length - 1; i >= 0; i--) {
+  if (!data) return null;
+
+  const entries: Array<Record<string, unknown>> = [];
+  for (const line of data.split('\n')) {
+    if (!line.trim()) continue;
     try {
-      const entry = JSON.parse(lines[i]);
-      if (entry.type === 'assistant' && entry.message?.content) {
-        const texts = entry.message.content
-          .filter((c: Record<string, unknown>) => c.type === 'text')
-          .map((c: Record<string, unknown>) => typeof c.text === 'string' ? c.text.trim() : '')
-          .filter((text: string) => text.length > 0);
-        if (texts.length > 0) return texts.join('\n\n');
-      }
-    } catch {}
+      entries.push(JSON.parse(line) as Record<string, unknown>);
+    } catch {
+      continue;
+    }
   }
-  return null;
+
+  if (entries.length === 0) return null;
+
+  let lastUserPromptIndex = -1;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (isRealUserPrompt(entries[i])) {
+      lastUserPromptIndex = i;
+      break;
+    }
+  }
+
+  const texts: string[] = [];
+  for (const entry of entries.slice(lastUserPromptIndex + 1)) {
+    if (entry.type !== 'assistant') continue;
+    texts.push(...extractAssistantTexts(entry));
+  }
+
+  return texts.length > 0 ? texts.join('\n\n') : null;
+}
+
+function getTranscriptCandidates(
+  payload: Record<string, unknown>,
+  cwd?: string | null,
+  sessionId?: string | null,
+): string[] {
+  const candidates = new Set<string>();
+  const add = (value: unknown): void => {
+    if (typeof value === 'string' && value.trim()) {
+      candidates.add(value.trim());
+    }
+  };
+
+  add(payload.agent_transcript_path);
+  add(payload.transcript_path);
+
+  const transcriptFromSession = resolveTranscriptPath(cwd, sessionId);
+  if (transcriptFromSession) {
+    candidates.add(transcriptFromSession);
+  }
+
+  return [...candidates];
+}
+
+function resolveTranscriptPath(cwd?: string | null, sessionId?: string | null): string | null {
+  if (!cwd || !sessionId) return null;
+
+  const encoded = cwd.replace(/\//g, '-');
+  const transcriptPath = path.join(os.homedir(), '.claude', 'projects', encoded, `${sessionId}.jsonl`);
+  return fs.existsSync(transcriptPath) ? transcriptPath : null;
+}
+
+function isRealUserPrompt(entry: Record<string, unknown>): boolean {
+  if (entry.type !== 'user') return false;
+
+  const message = (entry.message && typeof entry.message === 'object')
+    ? entry.message as Record<string, unknown>
+    : null;
+  if (!message) return false;
+
+  const content = message.content;
+  if (typeof content === 'string') {
+    return content.trim().length > 0;
+  }
+
+  if (!Array.isArray(content)) return false;
+
+  const contentTypes = content
+    .filter((item: unknown): item is Record<string, unknown> => !!item && typeof item === 'object')
+    .map((item) => item.type);
+
+  if (contentTypes.length === 0) return false;
+  if (contentTypes.every((type) => type === 'tool_result')) return false;
+
+  return content.some((item: unknown) => {
+    if (!item || typeof item !== 'object') return false;
+    const block = item as Record<string, unknown>;
+    return block.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0;
+  });
+}
+
+function extractAssistantTexts(entry: Record<string, unknown>): string[] {
+  const message = (entry.message && typeof entry.message === 'object')
+    ? entry.message as Record<string, unknown>
+    : null;
+  const content = message?.content;
+  if (!Array.isArray(content)) return [];
+
+  return content
+    .filter((item: unknown): item is Record<string, unknown> => !!item && typeof item === 'object')
+    .filter((item) => item.type === 'text')
+    .map((item) => typeof item.text === 'string' ? item.text.trim() : '')
+    .filter((text) => text.length > 0);
+}
+
+function extractTextFromLastAssistantMessage(value: unknown): string | null {
+  if (typeof value === 'string') {
+    return value.trim() || null;
+  }
+
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const message = value as Record<string, unknown>;
+  const content = message.content;
+  if (!Array.isArray(content)) {
+    return null;
+  }
+
+  const texts = content
+    .filter((item: unknown): item is Record<string, unknown> => !!item && typeof item === 'object')
+    .filter((item) => item.type === 'text')
+    .map((item) => typeof item.text === 'string' ? item.text.trim() : '')
+    .filter((text) => text.length > 0);
+
+  return texts.length > 0 ? texts.join('\n\n') : null;
 }
 
 function buildTelegramMessages(
